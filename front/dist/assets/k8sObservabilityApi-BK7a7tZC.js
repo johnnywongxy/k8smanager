@@ -1,0 +1,1 @@
+import{j as n}from"./index-zBOMwxj0.js";function o(t){const r=new URLSearchParams;Object.entries(t).forEach(([c,s])=>{s!==void 0&&s!==""&&r.set(c,String(s))});const i=r.toString();return i?`?${i}`:""}async function u(t){return n(`/k8s/logs/pods/${o({...t,cluster:t.cluster||void 0})}`)}async function a(t){return n(`/k8s/statistics/${o({cluster:t||void 0})}`)}export{a as g,u as q};

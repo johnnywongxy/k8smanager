@@ -1,0 +1,272 @@
+# kubeasz Kubernetes 集群运维实施规划（Local + containerd + SQLite + OSS）
+
+> 文档性质：实施前规划，只修改本文件，不实施代码、不执行部署。  
+> 适用代码：`front/`（Vue）+ `backend/`（Django）。  
+> 本版已吸收 `k8s2.txt`、`k8s3.txt`、`k8s4.txt` 的评审意见。
+
+## 1. 总体决策
+
+平台只保留 Local 模式：Django API 与一个部署 Worker 运行在同一台 Linux 平台服务器，Worker 原生执行 kubeasz/Ansible，通过 SSH 连接目标节点；目标节点不安装 Agent。Windows 仅作为开发机，使用 FakeRunner 或连接 Linux 执行机联调。
+
+数据库只允许 SQLite，开发和生产均使用同一个 SQLite 数据库文件。不引入 PostgreSQL、Redis、消息队列、Celery、第二个 Worker 或其它数据库/状态存储。部署任务严格单 Worker、单任务串行执行，前端用 HTTP 轮询任务状态和事件。现有 Pod 终端/日志 WebSocket 保持原状，不用于部署进度。
+
+集群运行时固定 `containerd`，不提供 Docker/Dockershim 选项。Helm 仅表示是否安装 Helm CLI，不是运行时。OSS 是既有对象存储配置，不作为数据库替代品。
+
+## 2. 整体范围与明确不做
+
+### 2.1 全部规划范围
+
+- AIO 新建：单 control-plane、单 etcd、单 worker。
+- HA 新建：至少 3 个 control-plane/etcd，worker 可独立扩展，需 API VIP/LB。
+- 已部署集群新增一个 Master、一个 Node（每个任务只处理一台节点）。
+- 同一 Kubernetes 次版本内的补丁升级；跨次版本升级不自动执行。
+- 集群级备份：etcd snapshot + kubeasz 配置/制品引用加密后上传 OSS。
+- 从 OSS 下载指定备份并恢复/回滚。
+- 版本/系统映射、预检、dry-run、配置编译、任务状态、日志、审计和诊断。
+
+### 2.2 明确不做
+
+- 不安装 Agent，不设计 Agent 心跳。
+- 不提供 Docker/Dockershim、Docker Runner、Redis、PostgreSQL、Celery、消息队列或多 Worker。
+- 不复用仓库中任何尚未完成的 Kubernetes 备份接口；集群级备份、上传、列表、恢复全部由本规划统一设计。
+- 一期不自动执行 `ezctl destroy` 或破坏性 cleanup。
+- Dashboard、Headlamp、Prometheus、ArgoCD、OpenEBS、Cilium、Kube-OVN 等不属于当前制品和范围。
+
+## 3. 当前代码基线
+
+已存在：`k8s_config` 版本/系统映射及配置中心；部署向导版本切换后的系统过滤；`storage.oss` 平台设置；`sync_kubeasz_artifacts.py` 发布同步命令；Helm 管理页面；kubeconfig 的 Fernet 加密（`backend/k8s_cluster/crypto.py`）和平台设置 SM4 加密。
+
+尚未实现：部署任务 app、单 Worker 调度、真实 kubeasz Runner、OSS 部署下载器、配置编译器、OS 真实检测、扩容/升级/备份/恢复任务、进度页、日志事件接口和崩溃恢复。现有任何 Kubernetes 备份接口均不作为本规划的完成依据，备份功能从零统一设计。
+
+## 4. 版本、系统与组件能力
+
+### 4.1 Kubernetes 与 kubeasz
+
+| Kubernetes | kubeasz | 状态 |
+|---|---|---|
+| 1.33 | 3.6.7 | 已配置 |
+| 1.34 | 3.6.8 | 已配置 |
+| 1.35 | 3.6.10 | 已配置 |
+| 1.36 | 3.7.0 | 已配置 |
+
+请求只提交 `k8s_version`，后端从映射表推导 kubeasz 版本并写入任务快照。扩容、升级、恢复使用集群当前生效版本或备份明确版本，不读取排队期间变化的配置中心。
+
+### 4.2 Kubernetes 与操作系统
+
+1.33/3.6.7、1.34/3.6.8、1.35/3.6.10 支持 AlmaLinux 8/9、Fedora 36/37、openSUSE Leap 15.x、Rocky Linux 8/9、Ubuntu 20.04/22.04/24.04；1.36/3.7.0 另支持 Debian 12/13、openEuler 22.03/24.03，Ubuntu 18 不支持。前端动态过滤只是体验，后端必须通过 SSH 读取 `/etc/os-release` 并硬校验真实 ID/VERSION_ID。
+
+### 4.3 制品能力
+
+每个 release 当前含源码、ezctl/ezdown、Kubernetes/ext-bin、对应 sys-pkg、Calico、Flannel、CoreDNS、NodeLocal DNS、Pause、Metrics Server 和 Helm CLI；1.34/1.35/1.36 当前含 Ingress-NGINX/webhook-certgen，1.33 不含。Ingress 由 manifest capability 动态决定，缺少时创建任务直接 400。部署侧只使用 `ezctl`；`ezdown` 仅供发布同步解析，禁止在目标部署流程执行。
+
+## 5. OSS 制品与备份存储
+
+### 5.1 既有 OSS 配置
+
+来源：平台管理 → 平台设置 → 基础设置 → OSS 配置，`SystemSetting.key=storage.oss`，当前为阿里云 OSS、Bucket `taichuaiops`、Endpoint `oss-cn-beijing.aliyuncs.com`、Base directory `kubeasz`、HTTPS 开启。密钥仅服务端加密保存；编辑使用 `********` 占位并由后端保留旧值。
+
+### 5.2 制品目录
+
+```text
+kubeasz/
+├── index.json
+└── releases/<kubeasz-version>/
+    ├── commands/ezctl
+    ├── commands/ezdown        # 仅发布侧解析，部署侧禁止执行
+    ├── source/kubeasz-<version>.zip
+    ├── images/<image>_amd64.tar
+    ├── helm/helm_amd64
+    └── manifest.json
+```
+
+当前约 122 个对象：1.33/3.6.7 为 26 个、1.34/3.6.8 为 28 个、1.35/3.6.10 为 28 个、1.36/3.7.0 为 31 个；manifest 的 `image_failures=0`。发布同步优先国内 Gitee，失败按白名单切 GitHub，必需制品失败则 release 不可发布。
+
+### 5.3 备份目录（统一新方案）
+
+```text
+kubeasz/backups/<organization-id>/<cluster-slug>/<backup-id>/
+├── archive.bin.enc       # 现有 Fernet 机制加密的归档
+├── pointer.json          # 非敏感指针：ID、密文大小、SHA-256、schema
+└── checksums.sha256      # 密文校验值
+```
+
+备份归档包含 etcd snapshot、任务/集群配置快照、inventory、config.yml、节点角色、Kubernetes/kubeasz 版本、插件清单、release manifest，以及恢复所需的 kubeasz 源码包和 ezctl；由此形成不依赖 release 后续状态的最小恢复工具包。归档还包含必要的 CA 公钥和 kubeconfig 加密字段，但不包含明文密码、OSS 密钥、SSH 临时凭据或业务 PV 数据。CA 私钥默认不导出，因此该方案支持原节点上的 etcd 状态恢复，不承诺在全新节点上重建全部集群身份；全新节点灾备若需 CA 私钥，必须单独授权并使用同一加密机制。
+
+### 5.4 备份加密与密钥边界
+
+不新增 AES/KMS 等组件，复用仓库已有 `cryptography`/Fernet 依赖及 `k8s_cluster.crypto` 的密钥派生规则。为避免大 snapshot 一次性进入内存，备份服务按固定大小分片加密并写入带长度边界的 `archive.bin.enc`，恢复时逐片验密和解密；默认单备份上限 8GB，超限在上传前失败。生产启动必须显式设置高强度 `DJANGO_SECRET_KEY`，检测到源码默认占位值时拒绝创建备份；Worker/Web 必须共享同一 settings 和密钥。密钥轮换会使旧备份无法解密，因此轮换前必须离线备份旧密钥并保留恢复环境。`pointer.json` 仅依赖 HTTPS、OSS 权限和密文 SHA-256，当前不做签名；若 OSS 凭据泄露，攻击者可替换密文和指针，这是已知残余风险，后续再评估非对称签名。
+
+备份保留规则为“至少保留最近 3 个成功备份优先于 30 天”：只有同时满足超过 30 天且不属于最近 3 个成功备份时才允许删除。删除先将 SQLite 元数据置为 `deleting`，OSS 删除成功后标记 deleted，失败标记 `delete_failed` 可重试。
+
+## 6. 任务、配置和路径模型
+
+### 6.1 任务与节点
+
+新增 `K8sDeployment`、`K8sDeploymentNode`、`K8sDeploymentEvent`、`K8sDeploymentLog`、`K8sDeploymentArtifactUse`、`K8sClusterBackup`、`K8sClusterConfigRevision`。任务快照不可变；集群当前配置是可版本化的生效状态，扩容/升级成功后追加 revision，后续任务读取最新 revision。
+
+向导 assign 仅是展示投影，不代表占用。创建任务时检查其它 `validating/queued/running` 任务是否占用目标机器，终态即释放。AIO 允许同机多角色；每个 add-master/add-worker 任务只提交一台机器。`K8sCluster.origin=imported|deployed` 明确区分接入型与部署型，运维操作仅对 deployed 开放。同一集群同一时刻最多存在一个非终态变更任务（扩容、升级、恢复）；备份执行期间也独占该集群。任务记录 `expected_config_revision`，真正开始时若已不是最新 revision，则以 `stale_cluster_revision` 失败，禁止用旧配置覆盖新状态。
+
+### 6.2 slug
+
+`display_name` 与不可变 `slug` 分离。slug 规则 `^[a-z][a-z0-9-]{1,30}$`、全局唯一，创建确认前可修改一次；新数据的 `Machine.cluster_name` 保存 slug。存量中文名称保留兼容并建立映射，不再用改名 debounce 同步机器表。
+
+### 6.3 工作区路径
+
+| 内容 | 路径 |
+|---|---|
+| OSS 内容哈希缓存 | `/var/lib/k8smanager/artifacts/<sha256>` |
+| 任务工作区 | `/var/lib/k8smanager/runs/<task-id>/` |
+| 本任务 kubeasz 源码 | `<run>/kubeasz/`（每任务解压一份） |
+| 集群目录 | `<run>/kubeasz/clusters/<slug>/` |
+| 诊断包 | `<run>/diagnostics/`，完成后按保留策略归档 |
+
+源码基线来自对应 release 的 `example/`：AIO 使用 all-in-one 模板，HA 使用 multi-node 模板；平台只覆盖明确列出的变量，其余继承上游默认。Worker 不执行 `ezctl checkout`，所有 kubectl 使用 `<run>/kubeconfig` 的显式 `--kubeconfig`，避免修改平台机 `~/.kube/config`。
+
+## 7. 后端实施规划
+
+### 7.1 文件结构
+
+新增 `backend/k8s_deployment/`：
+
+```text
+models.py; serializers.py; views.py; urls.py
+services/artifacts.py       # OSS 下载、哈希和缓存
+services/compiler.py        # example 基线 + 覆盖
+services/preflight.py       # OS/SSH/端口/磁盘/内核/时间/互通
+services/runner.py          # NativeKubeaszRunner、FakeRunner
+services/state_machine.py   # 串行调度、恢复、超时、重试
+services/backup.py          # snapshot、归档、加密、OSS 上传/下载
+services/credentials.py     # 临时凭据
+services/diagnostics.py     # 日志和诊断包
+management/commands/run_deploy_worker.py
+```
+
+### 7.2 SQLite 单 Worker 技术约束
+
+Worker 启动先获取 `/var/lib/k8smanager/worker.lock` 文件锁，获取失败立即退出；systemd 只管理一个实例。Worker 从 SQLite 领取任务时仅允许一个 `running`，其它任务 `queued`。SQLite 开启 WAL、`busy_timeout=5000`，日志按 100 行或 1 秒批量写入。启动恢复扫描将遗留 `running` 标记为 `failed/worker_interrupted`，清理无活动任务且超过 24 小时的工作区；不自动续跑。
+
+### 7.3 API 与权限
+
+```text
+POST /api/v1/k8s/deployments/                         # 新建 AIO/HA
+POST /api/v1/k8s/deployments/dry-run/
+GET  /api/v1/k8s/deployments/<id>/
+GET  /api/v1/k8s/deployments/<id>/events/?after=&limit<=200
+GET  /api/v1/k8s/deployments/<id>/logs/?cursor=&limit<=200
+POST /api/v1/k8s/clusters/<id>/nodes/add-master/
+POST /api/v1/k8s/clusters/<id>/nodes/add-worker/
+POST /api/v1/k8s/clusters/<id>/upgrade/
+POST /api/v1/k8s/clusters/<id>/backups/
+GET  /api/v1/k8s/clusters/<id>/backups/
+POST /api/v1/k8s/clusters/<id>/backups/<backup_id>/restore/
+```
+
+`/k8s/deployments` 使用 `page.k8s.deploy.view/create/retry/cancel`；集群运维 API 因现有 `/k8s/clusters` 前缀别名会命中 `page.k8s.clusters.view`，故动作码统一挂在 `page.k8s.clusters.add_master/add_worker/upgrade/backup/restore`，不能写成永远不会命中的 `page.k8s.deploy.*`。迁移需创建 `PermissionMenuAction` 并登记 API 别名；新增权限默认拒绝。当前不存在独立集群详情页，前端先在 `page.k8s.clusters.view` 的列表行展开抽屉承载运维入口，且 imported 集群隐藏全部运维按钮。
+
+### 7.4 状态、超时与取消
+
+通用状态：`draft → validating → queued → running → succeeded/failed/cancelled/rollback_required`。单阶段默认 2 小时、整任务默认 8 小时；超时必须同时标记失败、终止 Ansible 进程组、写事件并保留诊断，不能只改数据库状态。取消同样向 POSIX 进程组发送信号，提示远端 playbook 可能残留。队列页显示前方任务数量。
+
+## 8. 表单快照与 kubeasz 变量
+
+| 表单字段 | 快照字段 | kubeasz 位置/变量 |
+|---|---|---|
+| displayName/slug | display_name/slug | 集群目录名 |
+| k8sVersion | kubernetes_version | 版本选择 |
+| runtime | `containerd` | runtime 段默认 |
+| osType/osImage | os_type/os_version | sys-pkg 选择 |
+| highAvailable | topology_mode | hosts 角色模板 |
+| nodeNaming | node_naming | hosts hostname |
+| networkInterface | network_interface | hosts/config 网络变量 |
+| useCustomDataDir/dataDir | data_dir_enabled/data_dir | `CONTAINERD_STORAGE_DIR`、`CONTAINERD_ROOT_DIR`、`KUBELET_ROOT_DIR`；etcd 路径按该 release 模板单独覆盖 |
+| kubeProxyMode | kube_proxy_mode | kube-proxy 变量 |
+| podCIDR/serviceCIDR | pod_cidr/service_cidr | cluster 网络变量 |
+| apiServerPort | api_server_port | hosts `[all:vars]` 的 `SECURE_PORT` |
+| cniPlugin | cni_plugin | `06.network` 选择 Calico 或 Flannel |
+| metricsServer | metrics_server | addon 计划 |
+| nginxIngress | nginx_ingress | addon capability 校验 |
+| helm | install_helm_cli | Helm CLI 步骤 |
+| customCertValidity/certValidityDays | cert_validity_enabled/days | config.yml deploy 段 `CA_EXPIRY` 与 `CERT_EXPIRY`，转换为时长字符串；关闭时继承 kubeasz 默认（100 年/50 年） |
+| description | cluster_description | 集群属性 |
+| machine IDs/roles | `K8sDeploymentNode` | hosts inventory |
+
+证书自定义功能仅对 release 明确支持的版本开放；UI 必须说明一个输入值会同时覆盖 CA 与组件证书，不能暗示延长默认期限。`dataDir` 启用时预检检查该路径所在数据盘，否则检查系统盘。
+
+## 9. 预检与配置生成
+
+预检必须包括：SSH 登录；root 或 `sudo -n true`；真实 OS；目标磁盘（平台缓存 ≥20GB，etcd/control-plane 根盘或自定义 dataDir 盘 ≥40GB，worker ≥30GB，inode <80%）；ipvs 模式所需 `ip_vs/ip_vs_rr/ip_vs_wrr/ip_vs_sh/nf_conntrack`；API `SECURE_PORT`、etcd 2379/2380、kubelet 10250；chrony/timesync 且偏差 ≤2 秒；节点双向 TCP 互通；网卡 UP；CIDR 不冲突；Ingress/CNI/Metrics/Helm 制品能力。
+
+编译器以 release `example/` 模板为基线，AIO/HA 使用不同模板，只覆盖第 8 节变量。生成后做 YAML 解析、IP/角色覆盖、敏感字段扫描（拒绝 `ansible_password`、`ansible_ssh_pass`、`*_pass`）、0600 权限和配置哈希。dry-run 生成配置并完成全部预检，不执行 Ansible、不落正式部署任务。
+
+## 10. 任务执行规划
+
+### 10.1 新建 AIO/HA
+
+校验版本/OS/节点占用 → dry-run → 创建不可变任务快照 → 从 OSS 下载并校验 release → 预检 → 解压源码和模板 → 依次执行 `01.prepare → 02.etcd → 03.runtime → 04.kube-master → 05.kube-node → 06.network → 07.addons` → 健康检查 → 直接调用既有 kubeconfig service 加密回填 → 新增 `K8sClusterHealthCheck` 历史记录、集群配置 revision 和审计。HA 强制至少 3 个 control-plane/etcd 并验证 VIP/LB、etcd quorum。
+
+### 10.2 添加 Master
+
+仅 deployed HA 集群可用，一次一台节点。校验当前配置 revision、目标 OS、API/VIP/etcd 端口和节点残留，调用 `ezctl add-master <cluster> <ip>`；成功后追加配置 revision 和节点投影，检查 etcd quorum、API、多副本、Ready。失败不自动删除已产生资源。
+
+### 10.3 添加 Node
+
+一次任务只处理一个 worker，统一调用所有支持 release 均具备的 `ezctl add-node <cluster> <ip>`，前端不做多选。`add-nodes` 在 kubeasz 版本间不一致（3.6.7/3.6.8 无、3.6.10/3.7.0 有），平台不使用该命令，避免按版本产生不同的部分成功语义。成功后检查 containerd、CNI、kubelet、标签/taint 和 Ready，追加配置 revision；失败节点单独重试。
+
+### 10.4 升级
+
+升级仅支持同一 Kubernetes 次版本内的补丁版本；1.33→1.34、1.34→1.35、1.35→1.36 等跨次版本不自动升级，提示新建集群并迁移。升级前强制完成一次可用备份，检查版本 skew（保守要求节点版本一致、跨越 ≤2 个次版本）、etcd quorum、驱逐条件和目标制品。调用 `ezctl upgrade <cluster>`，严格执行 kubeasz 版本顺序并逐阶段健康检查；失败进入 `rollback_required`，平台不自动降级。升级成功后追加配置 revision、版本和 HealthCheck。
+
+## 11. 统一集群备份到 OSS
+
+### 11.1 创建备份
+
+备份任务调用 `ezctl backup <cluster>`，从 kubeasz 约定的 `<run>/kubeasz/clusters/<slug>/backup/` 定位实际 snapshot 文件，不猜固定文件名。平台本地可得的任务快照、当前配置 revision、inventory/config、插件和制品哈希与 snapshot 一起打包；需要从控制节点获取的 CA 公钥/证书元数据通过 SSH 单独读取，控制节点不可达时备份失败。备份不承诺 PV/业务数据。
+
+归档先生成内部 manifest（备份 ID、组织、slug、源 Kubernetes/kubeasz 版本、配置 revision、文件清单、大小、哈希、schema），再按固定大小使用现有 Fernet 能力分片加密，计算完整密文 SHA-256，上传 `archive.bin.enc`、`pointer.json`、`checksums.sha256`。上传后回读 OSS 校验大小和哈希，成功才写入 `K8sClusterBackup(status=succeeded)`；明文归档、临时凭据和临时文件在 finally 清理。备份内含对应 kubeasz 源码、ezctl 和 release manifest，因此 release 后续被撤销不影响该历史备份的恢复；被备份引用的最小恢复包不得随普通制品缓存清理。
+
+健康集群备份失败禁止标记成功；不要求为恢复再强制创建“应急备份”，避免集群已故障时形成死锁。恢复场景先探测 API/etcd：健康时可建议用户另做备份，不健康时允许直接恢复并记录风险。
+
+### 11.2 从 OSS 恢复/回滚
+
+恢复只能选择同组织、同 slug、同 Kubernetes 与 kubeasz 版本的备份；跨版本恢复不支持，需新建集群迁移。用户确认弹窗必须手动输入 display_name，并显示备份时间、版本、节点和哈希。下载 `pointer.json` 与密文后校验 SHA-256、大小和组织/slug，再用现有 Fernet 解密内部 manifest 和文件。
+
+由于 `ezctl restore` 默认恢复本地最近 snapshot，Worker 必须将用户选定的 snapshot 放入本任务 `clusters/<slug>/backup/` 的约定位置，并在隔离副本中显式覆盖 `roles/cluster-restore/defaults/main.yml` 的目标 snapshot 变量，执行前记录最终文件路径和哈希；禁止直接调用默认行为。随后调用 `ezctl restore <cluster>`，检查 etcd quorum、API、节点 Ready、CNI、DNS、Metrics，成功后新增 HealthCheck 和配置 revision。
+
+恢复失败进入 `rollback_required`，不自动换备份、不自动降级、不自动续跑。集群不健康时允许用户勾选“跳过应急备份”，二次输入 display_name 并记录审计；集群健康时若用户要求保护现状，应先单独完成备份任务。
+
+## 12. 前端规划
+
+现有部署向导保留版本→系统动态过滤、containerd 固定展示和 addon 能力提示，移除 Agent、Docker、exec_mode。新增部署 API、任务进度页、日志面板；进度页每 1~2 秒轮询任务详情，events 按 seq 增量拉取，日志按游标分页。集群列表行展开抽屉承载“添加 Master、添加 Node、升级、备份、备份记录/恢复”；`origin=imported` 集群隐藏这些入口。升级/恢复需要高风险确认和手动输入名称。
+
+## 13. 实施阶段（仅 SQLite）
+
+### Phase 0：基础约束
+
+准备 Linux 执行机、SQLite 文件备份和 WAL/busy_timeout、Worker 文件锁、统一 settings/`DJANGO_SECRET_KEY`、OSS 权限和缓存目录；禁止使用源码默认密钥；确认 API VIP/LB。
+
+### Phase 1：AIO + 统一备份
+
+完成任务/配置 revision 模型、单 Worker/FakeRunner、OSS 下载、配置编译、OS 预检、AIO、备份上传/列表/下载校验、HTTP 进度、权限审计和恢复单元测试。FakeRunner 覆盖成功、失败、取消、超时、Worker 中断和指定 snapshot 恢复。
+
+### Phase 2：HA 与增量运维
+
+完成 HA、add-master、add-worker、同版本补丁升级、etcd/VIP 检查和恢复实机验收；继续 SQLite 单 Worker，不引入其它组件。
+
+### Phase 3：受控扩展
+
+按需增加私钥认证、自动 cleanup、跨版本迁移辅助、备份签名/密钥轮换及应用级灾备整合；数据库仍只能是 SQLite。
+
+## 14. 验收标准
+
+- 版本/系统动态映射与真实 `/etc/os-release` 一致校验；Ingress/CNI/Metrics/Helm 制品缺失在任务创建前失败。
+- SQLite 只有一个 Worker 实例，文件锁可阻止第二实例；日志批量写入，无多 Worker/Redis/PostgreSQL。
+- AIO/HA 按 `01→07` 顺序执行；add-master 使用 `ezctl add-master`，add-worker 在所有版本统一使用单节点 `ezctl add-node`，不调用版本差异较大的 `add-nodes`。
+- 升级仅允许同次版本补丁，跨次版本明确拒绝；升级失败不自动降级。
+- 备份归档、内部 manifest、密文大小和 SHA-256 可在 OSS 回读验证；保留最近 3 个成功备份优先于 30 天清理。
+- 恢复严格使用用户选择的 snapshot，而不是本地最近 snapshot；同版本校验、解密、etcd/API/节点健康检查和审计完整。
+- Worker 崩溃/超时会终止进程组、标记任务失败并清理临时凭据；所有日志、诊断和 API 响应不含密钥。
+- imported 集群不可执行部署型运维；页面/操作权限按现有前缀机制实际生效。
+
+## 15. 不变原则
+
+Local only、containerd only、SQLite only、单 Worker 串行、平台机执行、目标节点不持有 OSS 凭据、后端版本映射、任务快照与配置 revision 分离、真实 OS 硬校验、指定备份显式恢复、哈希/解密失败即停止、破坏性操作人工确认。

@@ -1,0 +1,308 @@
+# k8s.txt 第三轮评审：新建集群还有哪些疑问
+
+> 文档性质：评审意见，不写代码、不修改 `k8s.txt`。
+> 评审对象：`k8s.txt`（296 行，已按 `k8s2.txt` 修订后的版本）。
+> 定位：`k8s2.txt` 提出的问题绝大部分已被本版 `k8s.txt` 采纳，本文**只列新版仍未回答、或回答不足以开工的空白**，不与 `k8s2.txt` 重复。
+> 主题范围：**准备新建 Kubernetes 集群**（向导 → 任务创建 → 制品 → 预检 → 配置生成 → 执行 → 恢复）。
+
+评审前已核对的仓库事实：
+
+| 事实 | 结论 | 证据 |
+|---|---|---|
+| `Machine` 是否有操作系统字段 | **没有** | `backend/k8s_machine/models.py`，字段仅 organization/name/ip_address/ssh_port/ssh_user/roles/cluster_name/status/last_test_*/remark/encrypted_password/password_rotated_at |
+| `Machine.cluster_name` 是否外键 | **不是**，是 CharField 字符串 | 同上 |
+| `sync_kubeasz_artifacts.py` 是否已有签名 | **完全没有**，只有 `sha256_file` 与 `_put_json` | `backend/ops/management/commands/sync_kubeasz_artifacts.py` |
+| `oss2` 依赖 | 已在 | `backend/requirements.txt:12` |
+| `k8s.txt` 4.2 节 OS 列表与迁移种子是否一致 | **逐项一致**（1.33/1.34/1.35 = LEGACY 10 项，1.36 = CURRENT 13 项） | `backend/k8s_config/migrations/0006_version_supported_systems.py:4-31` |
+| 部署页权限节点 | code=`page.k8s.deploy.view`，path=`/k8s/clusters/deploy`，`sidebar=False` | `backend/ops/migrations/0070_k8s_cluster_deploy_page.py:5-9` |
+| 表单字段总数 | 23 个 | `front/src/views/workbench/k8s/deploy/types/deploy.ts:30-55` |
+
+---
+
+## 一、阻断级疑问（不定清楚就无法开工）
+
+### 1.1 表单选的「操作系统」与节点真实系统无法校验 —— 这是当前最大的漏洞
+
+**k8s.txt 的说法：** 4.2 末「后端创建任务时再次校验，防止绕过前端提交不兼容组合」；9.4 预检清单为「SSH、sudo、内核模块、端口、磁盘、时间同步和节点互通」。
+
+**问题：** 上述两处校验都只能验证「Kubernetes 版本 ↔ 操作系统名」这对组合是否存在于映射表，**无法验证「操作系统名 ↔ 真实节点的实际系统」**。原因是 `Machine` 模型根本没有操作系统字段（见上表），而向导第 3 步选机器时也没有任何 OS 过滤。
+
+后果是确定的：5.2 与 8.3 按 OS 选择 `sys-pkg` 制品，用户随手选一个「Ubuntu 22.04」，节点实际却是 Rocky Linux 9，制品解包必然失败，而且失败发生在 `01.prepare` 阶段——此时集群目录、SSH 免密、部分系统包可能已经落地，属于「脏失败」，9.9 虽说不自动 destroy，但人工清理成本很高。
+
+**方案（建议两条都做，成本都很低）：**
+
+1. 预检新增一项 `os_release_check`，通过 SSH 读取 `/etc/os-release`，取 `ID` 与 `VERSION_ID`，与任务快照的 `osImage` 做归一化比对（需处理别名：`almalinux`/`alma linux`、`rockylinux`/`rocky linux`、`opensuse-leap`/`opensuse leap`）。不一致直接判定预检失败，并在失败消息里直接给出「节点实际为 X，请在向导中改选 Y」。
+2. 长期考虑给 `Machine` 增加 `os_type/os_version` 字段，在「机器管理 → 测试连接」时顺便采集并落库。这样向导在选机器时就能提前过滤，用户根本选不到不匹配的组合。此项若做，需要一次 `k8s_machine` 迁移；不做也不影响第 1 条兜底。
+
+**需要注意：** 别把这条做成「软告警」。1.1 属于选错就一定失败的类型，必须是硬阻断。
+
+### 1.2 选 1.33 同时开着 Nginx Ingress，行为未定义
+
+**k8s.txt 的说法：** 4.3「1.34/1.35/1.36 另含 Ingress-NGINX 及 webhook-certgen」；9.6「如启用 Ingress，使用该 release 的 Ingress-NGINX 制品」。
+
+**问题：** 4.3 已经明确 1.33 **没有** Ingress-NGINX 制品，但部署表单里 `nginxIngress` 默认是**开启**的（`front/src/views/workbench/k8s/deploy/types/deploy.ts:151`，`createClusterDeployForm()` 返回 `nginxIngress: true`）。于是「1.33 + 默认开关」这个完全自然的操作路径会走到：9.6 要求使用该 release 的 Ingress 制品 → 制品不存在 → 按 5.3「不得用其它版本自动回退」「不得静默跳过」，只能在 `07.addons` 阶段失败。
+
+这违反直觉：用户在向导里没做任何错事，却要等到部署末尾才失败。
+
+**方案（建议前后端双保险）：**
+
+| 层 | 做法 |
+|---|---|
+| 前端 | 选中 1.33 时，把 Nginx Ingress 开关置灰并强制关闭，旁边给出说明「该版本制品未包含 Ingress-NGINX，如需 Ingress 请升级到 1.34 及以上」 |
+| 后端 | 创建任务时若 `k8s_version=1.33 且 nginx_ingress=true`，直接返回 400，不进入队列 |
+| 前端（可选） | 确认步骤（`DeployStepConfirm.vue`）把「Nginx Ingress：关闭（该版本不支持）」作为显式提示项列出 |
+
+顺带请确认 4.3 的表述是否准确：**1.33 是「没上传」还是「上游不存在」**？如果只是本地没上传，管理员后续可能补传，那前端就不该写死禁用，而应由后端返回「该版本的 Ingress 制品是否可用」让前端动态渲染。这两种假设对应两套实现，需要先拍板。
+
+### 1.3 「机器未被其它活动任务占用」与向导的即时绑定互相打架
+
+**k8s.txt 的说法：** 9.2「后端校验权限、版本/系统映射、**机器未被其它活动任务占用**、幂等键并创建任务」；7.1「现有 `Machine.cluster_name/roles` 仅作为当前归属投影」。
+
+**问题：** 现行向导是**即时绑定**的——第 3 步「添加节点」时立刻调用后端的 assign 接口写 `Machine.cluster_name`（`deploy.ts:53-54` 的注释也写明「添加时即已同步到后端的机器表」）。而 `backend/k8s_machine/tests.py:298-320` 已经把「后一次 assign 抢占前一次归属」固化为**预期行为**。
+
+于是 9.2 的校验没有落脚点：
+
+- 若校验放在**创建任务时**：机器归属早在第 3 步就被本次操作自己改写了，此时去查「是否被其它任务占用」，查到的是自己，校验形同虚设。
+- 若校验放在**assign 时**：等于要推翻 `k8s_machine` 现有的抢占语义，属于行为变更，得连带改测试。
+
+此外「活动任务」尚未定义：`draft` 算不算占用？`queued` 呢？`failed` 的任务是否仍占着机器（用户可能想原地重试）？
+
+**建议的收敛方式：**
+
+1. 明确 **`K8sDeploymentNode` 才是节点归属的唯一真相**，在创建任务时从请求携带的 machine_id 列表一次性生成快照；`Machine.cluster_name/roles` 降级为纯展示投影，不参与任何校验。
+2. 创建任务时，用提交上来的 machine_id 列表去查「是否存在 *其它* 未终结任务（状态 ∈ {validating, queued, running}）已占用其中任一台机器」，命中则 400 并列出冲突的任务 ID 与集群名。注意查询条件是**其它任务**，自然避开了「自己占自己」的悖论。
+3. 明确占用释放时机：任务进入终态（succeeded / failed / cancelled / rollback_required）即视为释放。
+4. 向导期间的 assign 保持现状不动（它只是 UI 便利 + 列表展示），但要在实现说明里写清楚「向导里的绑定不代表占用」。
+
+**还要确认一点：** 一台机器同时作为 master 和 worker 是否允许（AIO 场景天然如此），以及**跨组织**能不能复用同一台机器。`Machine.ip_address` 是全局唯一的（无组织维度），但 `K8sDeployment` 带组织字段，这两者的组合规则需要明确。
+
+### 1.4 slug 从哪来、唯一性范围多大、`Machine.cluster_name` 存 slug 还是 display_name —— 三个问题都没答
+
+**k8s.txt 的说法：** 8 节末「平台支持的集群名称 display_name 可修改，slug 一旦创建不可修改」；7.1「slug 不可变、display_name 可改，删除前端改名时同步机器表的 debounce 逻辑」。
+
+**问题：** kubeasz 的目录结构是 `clusters/<slug>/hosts`，而现有集群名是用户输入的中文（截图里已有「阿里云-ecs-kubernetes」「windows-localhost」这类名字）。中文、空格、点号都不能直接进目录名。以下四项都未定义：
+
+| 待定项 | 影响 |
+|---|---|
+| slug 生成规则 | 用户输入中文名时 slug 取什么？拼音？哈希？还是让用户单独填一个英文标识？ |
+| slug 字符集与长度 | kubeasz 目录名、inventory 组名对字符有要求，需给出正则（建议 `^[a-z][a-z0-9-]{1,30}$`） |
+| slug 唯一性范围 | 全局唯一，还是组织内唯一？考虑到 `/var/lib/k8smanager/runs/<id>` 和 kubeasz 源码目录可能共享，建议**全局唯一** |
+| `Machine.cluster_name` 存什么 | 存 slug 好处是稳定（改名不用同步），坏处是列表页要反查显示名；存 display_name 则每次改名都要同步机器表（7.1 正是要删掉这类同步逻辑） |
+
+**建议：** 引入一个**独立的、用户可见但不可改的 `slug` 输入框**（放在「部署名称」下方，默认由部署名称自动生成，用户可在创建前修改一次），并明确：
+
+- slug 全局唯一，落库后永不变更；
+- `Machine.cluster_name` 存 **slug**（与 7.1「删除 debounce 同步逻辑」的方向一致，改名零成本）；
+- 集群列表展示时由前端用 `active_deployment_id` 反查 display_name，或后端在序列化时一并返回 `display_name`。
+
+如果采纳「存 slug」，那现有已接入集群（`cluster_name` 是中文）会与新数据混在一列里，需要在同一版里说明存量数据的处理（见 1.6）。
+
+### 1.5 Worker 崩溃/平台机重启后，`running` 任务怎么办 —— 完全没写
+
+**k8s.txt 的说法：** 6.1「一期先限制单 Worker、单任务并发」；7.2 给了完整状态机 `draft → validating → queued → running → succeeded/failed/cancelled/rollback_required`。
+
+**问题：** 状态机里没有描述**异常退出路径**。具体地：
+
+- Worker 进程被 kill、平台机断电重启、venv 依赖损坏导致 `run_deploy_worker.py` 起不来时，数据库里那个 `running` 的任务会永久卡住，前端进度页永远转圈（11 节的轮询拿不到终态）。
+- 没有心跳表或超时判定，所以没人能区分「任务正在跑」和「任务已经死了」。
+- 孤儿工作区：`/var/lib/k8smanager/runs/<deployment-id>`（6.1）在崩溃后会残留，可能带着临时 inventory（7.4 说权限 0600、`finally` 删除——但崩溃时 `finally` **不会执行**）。这既是磁盘泄漏，也是凭据残留。
+
+**必须补的内容：**
+
+1. Worker 启动时执行一次**恢复扫描**：把所有 `running` 状态的任务标记为 `failed`（错误码 `worker_interrupted`），并在事件里写明「平台 Worker 中断，任务状态未知，请核对节点实际状态后重试或清理」。**不建议自动重新入队**——kubeasz 的 `02.etcd`、`03.runtime` 等阶段不是幂等的，盲目续跑比停下更危险。
+2. 启动时清理超过 N 小时且无对应活动任务的 `runs/<id>` 工作区目录，并强制删除其中的临时 inventory。
+3. 明确「任务超时」的定义与检测方式（单阶段超时？整任务超时？超时后是标 failed 还是仅告警？）。
+4. 既然 6.1 已经承认 SQLite 撑不起租约，那至少需要一个**不依赖租约**的确定性恢复策略——上面第 1 条就是。请在文档里把它写成明确条款，而不是留给实现者即兴决定。
+
+### 1.6 存量「接入型」集群与新建「部署型」集群如何区分
+
+**k8s.txt 的说法：** 7.1「`K8sCluster` 的部署状态只作为投影……保留一个 `active_deployment_id` 外键即可」。
+
+**问题：** `K8sCluster` 表里已经存在通过「集群接入」导入的集群（截图可见「阿里云-ecs-kubernetes」「windows-localhost」），它们的 `active_deployment_id` 为 NULL。未说明：
+
+- 集群列表如何区分「接入的」和「部署的」？（仅凭 `active_deployment_id` 是否为空？那部署任务清理后会不会退化？）
+- 接入型集群能否被「重新部署」？（应该不能）
+- 部署型集群能否走「集群接入」的编辑/删除流程？（删除部署型集群时，kubeasz 目录和 OSS 缓存怎么办？）
+- 12 节说 cleanup/destroy 一期只出人工清单，那「删除集群」这个已有操作对部署型集群是否要禁用？
+
+**建议：** 给 `K8sCluster` 增加一个显式的来源字段（如 `origin = imported | deployed`），列表页据此分派可用操作。用 `active_deployment_id` 是否为空来推断来源是脆弱的——它会在任务记录被归档/清理后失真。
+
+---
+
+## 二、实现级疑问（不阻断开工，但开工后必然踩到）
+
+### 2.1 `helm` 开关对应 kubeasz 的哪一步，语义未定义
+
+**背景：** 4.3 说「所有 release 均含 Helm CLI」，而向导的「组件配置」里现在有一个 `helm` 布尔开关、默认开启（`deploy.ts:152`）。但 6/9.6 的 addon 阶段只列了 Calico/Flannel、CoreDNS、NodeLocal DNS、Metrics Server、Ingress，**没有 Helm**。
+
+于是「关闭 Helm」到底意味着什么，有三种互不相同的解释：① 不下载/不安装 Helm 客户端；② 不部署任何 Helm 应用（kubeasz 的 `07.addons` 里有部分组件走 Helm）；③ 两者都关。
+
+**建议：** 先确定语义再定 UI 文案。如果语义是①，那 4.3「所有 release 均含 Helm CLI」意味着制品始终存在，关掉只是跳过客户端安装；如果语义是②，那要列出「哪些 addon 依赖 Helm」，否则用户关掉后发现 Metrics Server 装不上，又是一个「走到末尾才失败」的坑。
+
+### 2.2 任务快照到底存哪些字段，需要一张对照表
+
+**k8s.txt 的说法：** 7.1「`K8sDeployment`……包含组织、幂等键、k8s_version、推导出的 kubeasz_version、拓扑参数、状态、当前阶段、进度、错误码、时间戳和制品快照」；7.3「请求只接收 `k8s_version`、拓扑、节点 ID、网络参数、幂等键**等**」。
+
+**问题：** 表单有 23 个字段，上面两处的枚举都用了「等」字，逐项对不上的至少有：
+
+| 表单字段 | 快照里存不存 | 说明 |
+|---|---|---|
+| `runtime` | ？ | 恒为 containerd，存了是冗余，不存则快照无法独立复现 |
+| `useCustomDataDir` + `dataDir` | ？ | 存布尔还是只存解析后的最终路径 |
+| `osType` + `osImage` | ？ | 存哪个？两者在配置中心是两级结构 |
+| `networkInterface` | ？ | 8 节说要映射成 kubeasz 变量，快照必须留 |
+| `nodeNaming` | ？ | 自动/手动影响 inventory 里 hostname 的生成，必须留 |
+| `highAvailable` | ？ | 与「master 数量 ≥3」是冗余表达，以哪个为准 |
+| `description` | ？ | 是集群属性还是任务属性 |
+
+**为什么这条重要：** 16 节把「任务表为状态真相」列为不可变原则，而 6.2 又明确「kubeasz inventory 中的节点角色来自任务快照，不能读取任务执行期间变化的机器表」。原则要求快照完整可复现，但字段清单是模糊的——实现时一定漏。
+
+**建议：** 在 7.1 补一张三列对照表：`表单字段 → K8sDeployment 列名 → 是否进 kubeasz 变量`。这张表同时也是一次自检：凡是「不进快照也不进变量」的字段，就应该从表单里删掉。
+
+**顺带一个相关的口径问题：** 8.3 说「根据版本映射选择对应 release、sys-pkg、镜像和 Helm 制品」。这里读的是**任务快照**里的 kubeasz_version，还是执行时刻的**映射表**？如果管理员在任务排队期间改了配置中心的映射，两者结果不同。按 16 节的原则应当是前者，建议在 8 节把「从任务快照读取」明确写出来。
+
+### 2.3 SQLite 下 Web 进程与 Worker 进程会抢锁，而进度页是 1~2 秒轮询
+
+**k8s.txt 的说法：** 6.1 只提到「当前 SQLite 不支持可靠租约和行级锁」；11 节要求「进度页一期每 1~2 秒轮询任务详情和 events，日志面板按游标分页」。
+
+**问题：** 6.1 关注的是**租约**（多 Worker 场景），漏掉了更早就会遇到的**写锁竞争**：部署进行中，Worker 高频写入日志与事件，同时 Web 进程被前端每 1~2 秒轮询一次。SQLite 是库级写锁，两边都写时会出现 `database is locked`。Ansible 输出量很大（开 `-v` 更甚），如果每行都单独 INSERT，这个冲突几乎是必现的。
+
+**建议（一期就得做，不能等迁 PostgreSQL）：**
+
+1. 日志**批量写入**：Worker 在内存中攒够 N 行或满 T 秒再一次性 `bulk_create`，不要逐行提交。
+2. 明确 SQLite 的 `WAL` 模式与 `busy_timeout`（例如 5000ms）配置，写进 6.1。
+3. 重新评估 11 节的轮询频率：任务详情 1~2 秒合理，但**事件**可以退化为「有变化才多拉」，或把两者合并成一次请求，减少一半的并发读。
+4. 考虑在一期就要求「真实部署必须在 PostgreSQL 上执行」，SQLite 仅用于开发与 FakeRunner 联调。这个口径比「Phase 2 再迁」更安全，且能避免把一个已知会坏的组合交付出去。
+
+### 2.4 日志没有容量上限与保留策略
+
+**k8s.txt 的说法：** 7.2「Ansible 原始 stdout/stderr 单独写 Log」；12 节「失败日志保留 stdout/stderr、阶段、退出码、制品哈希和配置哈希」。
+
+**问题：** 只说「保留」，没说保留多少、留多久。一次 kubeasz 全量部署的 Ansible 输出轻松上万行，多次重试再翻倍，SQLite 单表会被撑大。以下都未定义：
+
+- 单任务日志行数/字节上限（超出怎么办：截断？只留尾部？）
+- 日志表的总容量阈值与告警
+- 保留期与清理任务（谁在什么时候删）
+- 诊断包（`diagnostics.py`）里日志是全量还是截断
+
+**建议：** 给出明确数值。例如单任务上限 20 万行或 50MB，超出后停止写入正文并追加一条「日志已截断」的事件；保留期 30 天；诊断包日志取尾部 N 行 + 全部 ERROR 行。这类数值不给，实现者只能自己拍一个，最终运维时才发现库被撑爆。
+
+### 2.5 预检的阈值和清单不能只有名字
+
+**k8s.txt 的说法：** 9.4「预检 SSH、sudo、内核模块、端口、磁盘、时间同步和节点互通」；10.2「预检阶段验证 etcd peer、API VIP、端口和磁盘性能」。
+
+**问题：** 全是检查项的**名字**，没有判定标准。以下是已知会立刻卡住实现的：
+
+| 检查项 | 缺失的信息 |
+|---|---|
+| 磁盘 | 阈值多少？1.34 有 24 个镜像 tar，解包后占用不小，不同角色（master/etcd/worker）阈值是否不同？ |
+| 内核模块 | 清单是什么？表单默认 `kubeProxyMode: 'ipvs'`（`deploy.ts:147`），ipvs 模式需要 `ip_vs`/`ip_vs_rr`/`ip_vs_wrr`/`ip_vs_sh`/`nf_conntrack`。**清单是否随 kubeProxyMode 变化？** iptables 模式不需要这些 |
+| sudo | `ssh_user=root` 时不需要 sudo；非 root 时需要 `NOPASSWD`。如何判定，失败文案怎么写 |
+| 时间同步 | 偏差多少算不合格？chrony / systemd-timesyncd 两种实现都要覆盖 |
+| 端口 | 检查哪些端口？master 的 6443（或表单自定义的 `apiServerPort`）、etcd 的 2379/2380、kubelet 的 10250 |
+| 节点互通 | 双向还是单向？检查哪些端口？ |
+
+建议在 9.4 补一张表：`检查项 → 判定命令 → 通过阈值 → 失败文案`。这张表同时就是 `preflight.py` 的实现清单。
+
+### 2.6 containerd 2.x 的镜像加速配置写法与旧版不同，8 节没区分
+
+**k8s.txt 的说法：** 8.4「注入离线制品路径和镜像仓库配置，禁止目标节点访问 OSS」。
+
+**问题：** 4.1 的支持矩阵跨越 kubeasz 3.6.7 ~ 3.7.0。kubeasz 3.6.6 起 containerd 升级到 2.0，镜像加速配置从 Docker 风格的 `registry-mirrors` 改为 `certs.d/hosts.toml`。也就是说 **1.33/3.6.7 与 1.36/3.7.0 的配置模板不同**，而 8 节的渲染流程是一套。
+
+**建议：** `ConfigCompiler` 按 kubeasz 版本分支渲染这段配置，并在 8 节注明分界点。否则必然出现「1.36 部署时镜像拉取配置不生效」这类只在特定版本复现的问题，排查成本高。
+
+### 2.7 进度页的前端路由归属哪个权限码
+
+**k8s.txt 的说法：** 7.3「在 `backend/ops/permissions.py` 的 `API_PAGE_ALIASES` 登记 `/k8s/deployments`」；已核实 0070 迁移登记的页面 code 是 `page.k8s.deploy.view`、path 是 `/k8s/clusters/deploy`、`sidebar=False`。
+
+**问题：** 这里说的是 **API 别名**，但 11 节新增的 `DeploymentProgressPage.vue` 会有一个**前端路由**（例如 `/k8s/deployments/<id>`）。用户在该页刷新时，前端路由守卫用哪个页面码判定「能不能进」？
+
+同时有个权限设计问题：如果进度页只看 `page.k8s.deploy.view`，那只有 `create` 权限、没有 `view` 权限的用户点完「开始部署」就看不到自己的任务；如果只看 `create`，那查看历史任务又需要 view。**建议：进度页统一用 `page.k8s.deploy.view` 作为进入条件**，页面内的「重试 / 取消 / 清理」按钮再各自校验 `page.k8s.deploy.retry/cancel/cleanup`。这个口径要写进 7.3。
+
+### 2.8 OSS 签名的威胁模型没定，算法和密钥托管就无从谈起
+
+**k8s.txt 的说法：** 5.2 注释「index.json（应签名）」；5.3「更新并签名 `index.json`」；14 Phase 0「确认 OSS 签名密钥」。
+
+**已核实：** `sync_kubeasz_artifacts.py` 里**完全没有签名实现**，`index.json` 目前是明文 JSON（只含 `schema_version`/`generated_at`/`source_repository`/`local_execution_mode`/`releases`）。所以签名是 100% 的新增工作，而不是「补一下」。
+
+**未定义的关键点：**
+
+- **威胁模型**：既然已启用 HTTPS、且 OSS 凭据只存在服务端（5.1），签名防的究竟是「凭据泄露后攻击者投毒制品」还是「传输链篡改」？前者需要密钥与 OSS 凭据**分离保管**（否则攻击者拿到凭据的同时也能拿到签名密钥，签名毫无意义）；后者 HTTPS 已经覆盖。**这个前提不定，签名就可能是安全剧场。**
+- **算法**：HMAC-SHA256？还是非对称签名（Ed25519/RSA）？若要与 OSS 凭据分离，非对称更合适（平台只存公钥）。
+- **密钥存哪**：Django settings？环境变量？还是复用 `data_security/sm4.py` 的密钥体系？注意后者是**对称加密**用途，与签名语义不同，不宜混用。
+- **轮换**：Phase 3 提了「制品签名轮换」，但没说来过渡期如何同时验新旧签名。
+- **验签失败的行为**：5.3 说「manifest 校验失败即停止」（16 节），但签名失败是否等同？如果密钥丢失，是不是所有历史 release 全部不可部署？需要有降级与运维预案。
+
+**建议：** 先把威胁模型写清楚，再定算法与托管方式。如果结论是「HTTPS + 服务端凭据已足够」，那就应该把签名从一期范围里**显式移除**（而不是留一个含糊的「应签名」），避免为一个说不清收益的功能占用 Phase 0 的决策成本。
+
+### 2.9 `import_kubeconfig` 的调用路径未定义
+
+**k8s.txt 的说法：** 9.8「加密保存 kubeconfig，更新 `K8sCluster` 投影状态，并创建 `K8sClusterHealthCheck`」。
+
+**问题：** `backend/k8s_cluster/` 已有 `import_kubeconfig` 逻辑（Fernet 加密，密钥由 `SECRET_KEY` 派生），但它目前没有 API 暴露。Worker 进程要回填 kubeconfig，是**直接调用 service 函数**，还是**走一个内部 HTTP 接口**？
+
+这关系到两个部署前提：
+
+- 直接调用要求 Worker 与 Web 进程使用**完全相同**的 `SECRET_KEY` 和 `data_security` 配置（同一份 settings、同一环境变量），否则 Web 侧解密失败。
+- 走内部接口则要额外考虑 Worker 的身份凭证与内网暴露面。
+
+**建议：** 明确采用「Worker 直接调用 service 函数，且与 Web 共用同一份 settings 与环境变量」，并在 6.1 的部署前提里把这条列出来（这是一个很容易在部署时踩到的运维前提）。
+
+---
+
+## 三、建议（非疑问，属于可增量的改进）
+
+### 3.1 强烈建议增加「部署前预演」（dry-run）
+
+**理由：** 8 节的 `ConfigCompiler` 和 9.4 的 `preflight` 本身就是两个独立的、不执行 Ansible 的组件。把它们组合起来做一个 dry-run 接口——生成 inventory/config.yml 并**在页面上展示**，同时跑完全部预检——成本极低（复用已有组件，不碰 runner），但收益很大：
+
+- 1.1 的 OS 不匹配、1.2 的 Ingress 制品缺失、2.5 的磁盘/内核模块不足、网络不通、端口占用，**全部可以在按下「开始部署」之前暴露**；
+- 用户能亲眼看到将要生成的 inventory，对「任务表为状态真相」这个原则也是一种直观验证；
+- 部署失败的代价很高（9.9 不自动 destroy，人工清理），而 dry-run 把大部分失败前移到了零成本的阶段。
+
+建议在 7.3 增加 `POST /api/v1/k8s/deployments/<id>/dry-run/`，或独立一个 `POST /api/v1/k8s/deploy-dry-run/`（不落任务记录，只返回渲染结果 + 预检结果）。权限上复用 `page.k8s.deploy.create`。
+
+### 3.2 取消任务时杀进程组，不要只杀父进程
+
+12 节说「取消只在安全边界生效，向 kubeasz 子进程发送终止信号并回收临时文件」。需要注意的是 Ansible 会 fork 出 SSH 子进程，**只 kill 父进程会留下孤儿的 ssh 与远端仍在执行的 playbook**——用户以为取消了，节点上其实还在跑。
+
+建议明确：Worker 以独立进程组启动 Ansible，取消时向**进程组**发信号（POSIX 下 `os.killpg`），并对远端残留给出提示（因为远端 playbook 无法从平台侧直接终止）。
+
+### 3.3 「危险阶段需人工确认」的确认形式未定义
+
+7.2 说「etcd/master 默认要求人工确认；禁止任意 `from_phase` 跳跃」，15 节说「危险阶段需人工确认」。但没说确认长什么样。建议明确为：**弹窗要求用户手动输入集群 display_name**（而非点一个「我确认」按钮），并在审计日志里记录确认人、时间、目标阶段、原失败阶段。这样这条规则才真正有约束力。
+
+### 3.4 `K8sCluster` 状态枚举是否要加 `failed` 档（`k8s2.txt` 提过，新版仍未答）
+
+7.2 的 `K8sDeployment` 有 `failed`，7.1 说 `K8sCluster` 是投影。那投影要不要把 `failed` 传过去？如果不传，集群列表里一个部署失败的集群会显示成什么状态？如果传，`K8sCluster.status` 的枚举需要同步扩展，涉及 `k8s_cluster` 的迁移与前端展示。**这是 `k8s2.txt` 第 4 节的遗留问题，需要一个明确答案。**
+
+---
+
+## 四、优先级建议
+
+若按「不定清楚就无法开工」排序：
+
+| 优先级 | 条目 | 理由 |
+|---|---|---|
+| P0 | 1.1 OS 一致性校验 | 当前最大漏洞，且必然导致脏失败 |
+| P0 | 1.2 1.33 + Ingress 组合 | 默认路径就能触发，用户无过错 |
+| P0 | 1.3 机器占用校验时机 | 9.2 的校验目前无处安放 |
+| P0 | 1.4 slug 规则 | 影响目录结构、`Machine.cluster_name` 语义、存量数据 |
+| P0 | 1.5 Worker 崩溃恢复 | 状态机会卡死，且有凭据残留风险 |
+| P1 | 2.2 字段快照对照表 | 「任务表为状态真相」原则的落地前提 |
+| P1 | 2.3 SQLite 写竞争 | 一期就会遇到，可能直接判死 SQLite 方案 |
+| P1 | 2.5 预检阈值 | `preflight.py` 的实现清单 |
+| P1 | 2.8 签名威胁模型 | Phase 0 的决策项，不先定就是空转 |
+| P2 | 其余 | 可在实现阶段并行确认 |
+
+---
+
+## 五、本次评审未涉及的部分
+
+以下内容本轮没有深入，不代表没有问题，只是不在「准备新建集群」这个主题的核心路径上：
+
+- HA 的 VIP/负载均衡选型（10.1 提到需规划，但属于基础设施决策）
+- Phase 3 的升级/扩容（13 节外的未来范围）
+- 前端样式与交互细节（本轮只评审了表单字段与开关的语义）
+- 与「集群接入」既有功能的完整兼容性矩阵（本文只在 1.6 触及边界）

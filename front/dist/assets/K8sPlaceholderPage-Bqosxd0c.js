@@ -1,0 +1,1 @@
+import{d as l,l as a,m as n,q as t,v as r}from"./index-zBOMwxj0.js";const p={class:"k8s-placeholder"},d=l({__name:"K8sPlaceholderPage",props:{title:{}},setup(s){const o=s;return(c,e)=>(a(),n("section",p,[t("h2",null,r(o.title),1),e[0]||(e[0]=t("p",null,"该页面已纳入 K8s 管理一期菜单骨架，功能会按 k8s规划1.txt 的六期计划逐期落地。",-1))]))}});export{d as default};
